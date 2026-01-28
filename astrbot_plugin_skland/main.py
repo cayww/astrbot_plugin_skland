@@ -6,7 +6,10 @@ Commands:
 - skd (private): Show user's own sign-in status
 - skdlogin (private): Login with token and immediately sign in
 - skdlogout (private): Logout and remove token
-- skdauto (private): Toggle auto sign-in at 01:00 daily
+
+Config (AstrBot 后台):
+- auto_sign_enabled: 自动签到开关
+- auto_sign_hour: 自动签到时间（小时，0-23）
 """
 
 from datetime import datetime
@@ -19,11 +22,14 @@ import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.star.config import load_config, put_config
 
 from .skland_api import SklandAPI
 
+PLUGIN_NAME = "astrbot_plugin_skland"
 
-@register("astrbot_plugin_skland", "AstrBot", "森空岛自动签到插件", "1.1.0")
+
+@register(PLUGIN_NAME, "AstrBot", "森空岛自动签到插件", "1.1.0")
 class SklandPlugin(Star):
     """森空岛签到插件"""
 
@@ -31,15 +37,42 @@ class SklandPlugin(Star):
         super().__init__(context)
         self.api = SklandAPI(max_retries=3)
         self.scheduler = AsyncIOScheduler()
+        self._init_config()
+
+    def _init_config(self):
+        """初始化后台配置项"""
+        # 注册配置项到 AstrBot 后台
+        put_config(
+            namespace=PLUGIN_NAME,
+            name="自动签到开关",
+            key="auto_sign_enabled",
+            value=False,
+            description="开启后，将在指定时间自动为所有已注册用户签到，并私发结果"
+        )
+        put_config(
+            namespace=PLUGIN_NAME,
+            name="自动签到时间（小时）",
+            key="auto_sign_hour",
+            value=1,
+            description="自动签到执行的小时（0-23），默认凌晨1点"
+        )
+
+    def _get_config(self) -> dict:
+        """获取当前配置"""
+        config = load_config(PLUGIN_NAME)
+        if not config:
+            return {"auto_sign_enabled": False, "auto_sign_hour": 1}
+        return config
 
     async def initialize(self):
         """插件初始化"""
         logger.info("森空岛签到插件已加载")
         
-        # 检查自动签到是否开启，如果开启则启动定时任务
-        auto_sign_enabled = await self.get_kv_data("auto_sign_enabled", False)
-        if auto_sign_enabled:
-            self._start_auto_sign_job()
+        # 根据后台配置决定是否启动自动签到
+        config = self._get_config()
+        if config.get("auto_sign_enabled", False):
+            hour = config.get("auto_sign_hour", 1)
+            self._start_auto_sign_job(hour)
         
         if not self.scheduler.running:
             self.scheduler.start()
@@ -53,10 +86,13 @@ class SklandPlugin(Star):
 
     # ==================== Auto Sign-In ====================
 
-    def _start_auto_sign_job(self):
+    def _start_auto_sign_job(self, hour: int = 1):
         """启动自动签到定时任务"""
-        # 每天凌晨1点执行
-        trigger = CronTrigger(hour=1, minute=0)
+        # 确保 hour 在有效范围
+        hour = max(0, min(23, hour))
+        
+        # 每天指定小时执行
+        trigger = CronTrigger(hour=hour, minute=0)
         
         # 移除已存在的任务（如果有）
         try:
@@ -70,7 +106,7 @@ class SklandPlugin(Star):
             id="skland_auto_sign",
             misfire_grace_time=3600,  # 1小时容错
         )
-        logger.info("森空岛自动签到任务已启动，将在每天 01:00 执行")
+        logger.info(f"森空岛自动签到任务已启动，将在每天 {hour:02d}:00 执行")
 
     def _stop_auto_sign_job(self):
         """停止自动签到定时任务"""
@@ -82,6 +118,12 @@ class SklandPlugin(Star):
 
     async def _auto_sign_all_users(self):
         """为所有已注册用户执行自动签到"""
+        # 再次检查配置，确保功能仍然开启
+        config = self._get_config()
+        if not config.get("auto_sign_enabled", False):
+            logger.info("自动签到已在后台关闭，跳过执行")
+            return
+        
         logger.info("开始执行自动签到...")
         
         users = await self.get_kv_data("users", {})
@@ -92,10 +134,6 @@ class SklandPlugin(Star):
         
         for user_id, user_data in users.items():
             if "token" not in user_data:
-                continue
-            
-            # 检查用户是否开启了自动签到
-            if not user_data.get("auto_sign", True):  # 默认开启
                 continue
             
             try:
@@ -239,52 +277,6 @@ class SklandPlugin(Star):
     # ==================== Commands ====================
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
-    @filter.command("skdauto")
-    async def skdauto(self, event: AstrMessageEvent):
-        """
-        开关自动签到功能
-        
-        使用方法: /skdauto
-        开启后每天凌晨1点自动为您签到，并私发结果
-        """
-        user_id = event.get_sender_id()
-        user_data = await self._get_user_data(user_id)
-        
-        if not user_data or "token" not in user_data:
-            yield event.plain_result(
-                "您还未绑定森空岛账号\n"
-                "请先使用 /skdlogin <token> 进行登录"
-            )
-            return
-        
-        # 切换自动签到状态
-        current_status = user_data.get("auto_sign", True)  # 默认开启
-        new_status = not current_status
-        user_data["auto_sign"] = new_status
-        await self._save_user_data(user_id, user_data)
-        
-        # 检查全局自动签到任务状态
-        auto_sign_enabled = await self.get_kv_data("auto_sign_enabled", False)
-        
-        if new_status:
-            # 用户开启了自动签到
-            if not auto_sign_enabled:
-                # 全局任务未启动，启动它
-                await self.put_kv_data("auto_sign_enabled", True)
-                self._start_auto_sign_job()
-            
-            yield event.plain_result(
-                "✅ 自动签到已开启\n\n"
-                "每天凌晨 01:00 将自动为您签到\n"
-                "签到结果会私发给您"
-            )
-        else:
-            yield event.plain_result(
-                "❌ 自动签到已关闭\n\n"
-                "您可以随时使用 /skdauto 重新开启"
-            )
-
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     @filter.command("skdlogin")
     async def skdlogin(self, event: AstrMessageEvent, token: str = ""):
         """
@@ -323,7 +315,6 @@ class SklandPlugin(Star):
                 "nickname": nickname,
                 "last_sign": {},
                 "bound_at": datetime.now().isoformat(),
-                "auto_sign": True,  # 默认开启自动签到
                 "platform_name": event.get_platform_name(),  # 保存平台信息
             }
 
@@ -335,19 +326,9 @@ class SklandPlugin(Star):
                     user_data["last_sign"]["endfield"] = datetime.now().strftime("%Y-%m-%d")
 
             await self._save_user_data(user_id, user_data)
-            
-            # 确保全局自动签到任务已启动
-            auto_sign_enabled = await self.get_kv_data("auto_sign_enabled", False)
-            if not auto_sign_enabled:
-                await self.put_kv_data("auto_sign_enabled", True)
-                self._start_auto_sign_job()
 
             # Format response
-            response = (
-                f"登录成功！\n{self._format_sign_status(results, nickname)}\n\n"
-                f"✅ 自动签到已默认开启（每天 01:00）\n"
-                f"使用 /skdauto 可关闭"
-            )
+            response = f"登录成功！\n{self._format_sign_status(results, nickname)}"
             yield event.plain_result(response)
 
         except Exception as e:
@@ -539,9 +520,7 @@ class SklandPlugin(Star):
                         )
                 await self._save_user_data(user_id, user_data)
 
-                # 显示自动签到状态
-                auto_sign_status = "开启" if user_data.get("auto_sign", True) else "关闭"
-                response = f"{self._format_sign_status(results, nickname)}\n\n⏰ 自动签到: {auto_sign_status}"
+                response = self._format_sign_status(results, nickname)
                 yield event.plain_result(response)
 
             except Exception as e:

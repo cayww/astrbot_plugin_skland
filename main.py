@@ -15,7 +15,7 @@ Config (AstrBot plugin config):
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-
+from astrbot.core.star.filter.permission import PermissionType
 import astrbot.api.message_components as Comp
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter, MessageChain
@@ -84,7 +84,7 @@ class SklandPlugin(Star):
     def _start_auto_sign_job(self, hour: int = 1):
         """启动自动签到定时任务"""
         hour = max(0, min(23, hour))
-        trigger = CronTrigger(hour=16, minute=0)
+        trigger = CronTrigger(hour=hour, minute=0)
         try:
             self.scheduler.remove_job("skland_auto_sign")
         except Exception:
@@ -177,6 +177,15 @@ class SklandPlugin(Star):
 
     # ==================== Commands ====================
 
+    @filter.command("skd help")
+    async def skdhelp(self, event: AstrMessageEvent):
+        """森空岛签到插件帮助"""
+        yield event.plain_result("森空岛签到插件帮助\n"
+                                 "1. 私聊机器人发送/skdlogin <token> 登录并签到\n"
+                                 "2. 私聊机器人发送/skdlogout 登出\n"
+                                 "3. /skd 查看签到状态"
+                          )
+        
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     @filter.command("skdlogin")
     async def skdlogin(self, event: AstrMessageEvent, token: str = ""):
